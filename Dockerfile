@@ -1,4 +1,4 @@
-FROM gcr.io/moonrhythm-containers/builder
+FROM registry.moonrhythm.io/builder
 
 ENV CGO_ENABLED=0
 

@@ -14,11 +14,16 @@ jobs:
       with:
         credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
         token_format: access_token
-    - uses: docker/login-action@v1
+    - uses: docker/login-action@v2
       with:
         registry: asia-southeast1-docker.pkg.dev
         username: oauth2accesstoken
         password: ${{ steps.auth.outputs.access_token }}
+    - uses: docker/login-action@v2
+      with:
+        registry: ${{ secrets.REGISTRY }}
+        username: ${{ secrets.REGISTRY_USER }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
     - uses: docker/setup-buildx-action@v2
       with:
         version: latest
@@ -26,4 +31,6 @@ jobs:
       with:
         provenance: false
         push: true
-        tags: asia-southeast1-docker.pkg.dev/deploys-app/public/log:${{ github.sha }}
+        tags: |
+          asia-southeast1-docker.pkg.dev/deploys-app/public/log:${{ github.sha }}
+          ${{ secrets.REGISTRY }}/deploys-app/log:${{ github.sha }}
