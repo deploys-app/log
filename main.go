@@ -246,18 +246,15 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var status struct {
-		Count  int `json:"count"`
-		Ready  int `json:"ready"`
-		Failed int `json:"failed"`
+		Count     int `json:"count"`
+		Ready     int `json:"ready"`
+		Succeeded int `json:"succeeded"`
+		Failed    int `json:"failed"`
 	}
 
 	podsLocker.RLock()
 	for name, p := range pods {
 		if !strings.HasPrefix(name, podID) {
-			continue
-		}
-		// cronjob
-		if p.Status.Phase == "Succeeded" {
 			continue
 		}
 
@@ -287,7 +284,10 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		if p.Status.ContainerStatus.Ready {
 			status.Ready++
 		}
-		if p.Status.Phase == "Failed" {
+		switch p.Status.Phase {
+		case "Succeeded":
+			status.Succeeded++
+		case "Failed":
 			status.Failed++
 		}
 	}
