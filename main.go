@@ -283,7 +283,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		for _, c := range p.Status.Conditions {
 			// skip DisruptionTarget pod
 			if c.Type == "DisruptionTarget" && c.Status == "True" { // reason: TerminationByKubelet
-				continue
+				goto skip
 			}
 		}
 
@@ -297,6 +297,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		case "Failed":
 			status.Failed++
 		}
+
+	skip:
 	}
 	podsLocker.RUnlock()
 
