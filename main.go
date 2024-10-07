@@ -280,6 +280,13 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		for _, c := range p.Status.Conditions {
+			// skip DisruptionTarget pod
+			if c.Type == "DisruptionTarget" && c.Status == "True" { // reason: TerminationByKubelet
+				continue
+			}
+		}
+
 		status.Count++
 		if p.Status.ContainerStatus.Ready {
 			status.Ready++
