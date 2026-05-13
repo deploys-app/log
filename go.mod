@@ -1,6 +1,6 @@
 module github.com/deploys-app/log
 
-go 1.24.1
+go 1.26.3
 
 require (
 	github.com/acoshift/configfile v1.9.0
