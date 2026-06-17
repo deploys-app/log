@@ -137,8 +137,6 @@ func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func
 	defer cancel()
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, pod := range pods {
-		pod := pod
-
 		// k8s 1.18 scheduler spam with NodeAffinity event
 		if pod.Status.Phase == "Failed" && pod.Status.Reason == "NodeAffinity" {
 			continue
