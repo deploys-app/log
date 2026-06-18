@@ -56,6 +56,7 @@ func main() {
 	mux.HandleFunc("/event", eventHandler)
 	mux.HandleFunc("/pods", podsHandler)
 	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/errors", errorsHandler)
 	// mux.HandleFunc("/proxy", proxyHandler)
 
 	srv := parapet.NewBackend()
@@ -257,34 +258,8 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(name, podID) {
 			continue
 		}
-
-		// k8s 1.18 scheduler spam with NodeAffinity event
-		if p.Status.Phase == "Failed" && p.Status.Reason == "NodeAffinity" {
+		if isNoisePod(p) {
 			continue
-		}
-
-		// node preempted
-		if p.Status.Phase == "Failed" && p.Status.Reason == "Terminated" && strings.Contains(p.Status.Message, "node shutdown") {
-			// message = Pod was terminated in response to imminent node shutdown.
-			continue
-		}
-
-		// node shutdown
-		if p.Status.Phase == "Failed" && p.Status.Reason == "NodeShutdown" && strings.Contains(p.Status.Message, "shutting down") {
-			// message = Pod was rejected as the node is shutting down.
-			continue
-		}
-
-		// skip Evicted pod
-		if p.Status.Reason == "Evicted" {
-			continue
-		}
-
-		for _, c := range p.Status.Conditions {
-			// skip DisruptionTarget pod
-			if c.Type == "DisruptionTarget" && c.Status == "True" { // reason: TerminationByKubelet
-				goto skip
-			}
 		}
 
 		status.Count++
@@ -297,14 +272,110 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		case "Failed":
 			status.Failed++
 		}
-
-	skip:
 	}
 	podsLocker.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(status)
+}
+
+// isNoisePod reports whether a pod is an infrastructure-induced artifact
+// (node shutdown/eviction/preemption/disruption) rather than a signal about the
+// workload itself. /status and /errors must agree on this filter so the
+// readiness tally and the surfaced error pods describe the same candidate set.
+func isNoisePod(p *k8s.Pod) bool {
+	// k8s 1.18 scheduler spam with NodeAffinity event
+	if p.Status.Phase == "Failed" && p.Status.Reason == "NodeAffinity" {
+		return true
+	}
+	// node preempted; message = Pod was terminated in response to imminent node shutdown.
+	if p.Status.Phase == "Failed" && p.Status.Reason == "Terminated" && strings.Contains(p.Status.Message, "node shutdown") {
+		return true
+	}
+	// node shutdown; message = Pod was rejected as the node is shutting down.
+	if p.Status.Phase == "Failed" && p.Status.Reason == "NodeShutdown" && strings.Contains(p.Status.Message, "shutting down") {
+		return true
+	}
+	// evicted pod
+	if p.Status.Reason == "Evicted" {
+		return true
+	}
+	// voluntary disruption (reason: TerminationByKubelet)
+	for _, c := range p.Status.Conditions {
+		if c.Type == "DisruptionTarget" && c.Status == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+type podError struct {
+	Name                   string `json:"name"`
+	Phase                  string `json:"phase"`
+	Ready                  bool   `json:"ready"`
+	RestartCount           int    `json:"restartCount"`
+	WaitingReason          string `json:"waitingReason,omitempty"`
+	WaitingMessage         string `json:"waitingMessage,omitempty"`
+	TerminatedReason       string `json:"terminatedReason,omitempty"`
+	TerminatedExitCode     int32  `json:"terminatedExitCode,omitempty"`
+	LastTerminatedReason   string `json:"lastTerminatedReason,omitempty"`
+	LastTerminatedExitCode int32  `json:"lastTerminatedExitCode,omitempty"`
+	Message                string `json:"message,omitempty"`
+}
+
+// errorsHandler returns the non-ready pods for a deployment together with the
+// raw k8s failure reasons (CrashLoopBackOff, ImagePullBackOff, OOMKilled, ...).
+// It applies the same noise filter as /status, so the two endpoints describe
+// the same candidate set. Reasons are emitted raw; consumers (console, the
+// apiserver reconcile) interpret them — no classification enum is imposed here.
+func errorsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	podID, ok := validToken(r.FormValue("t"))
+	if !ok {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	res := []*podError{}
+	podsLocker.RLock()
+	for name, p := range pods {
+		if !strings.HasPrefix(name, podID) {
+			continue
+		}
+		if isNoisePod(p) {
+			continue
+		}
+		cs := p.Status.ContainerStatus
+		if cs.Ready {
+			continue
+		}
+		res = append(res, &podError{
+			Name:                   p.Name,
+			Phase:                  p.Status.Phase,
+			Ready:                  cs.Ready,
+			RestartCount:           cs.RestartCount,
+			WaitingReason:          cs.WaitingReason,
+			WaitingMessage:         cs.WaitingMessage,
+			TerminatedReason:       cs.TerminatedReason,
+			TerminatedExitCode:     cs.TerminatedExitCode,
+			LastTerminatedReason:   cs.LastTerminatedReason,
+			LastTerminatedExitCode: cs.LastTerminatedExitCode,
+			Message:                p.Status.Message,
+		})
+	}
+	podsLocker.RUnlock()
+
+	// stable order; map iteration is otherwise random
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Name < res[j].Name
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(res)
 }
 
 func eventHandler(w http.ResponseWriter, r *http.Request) {
