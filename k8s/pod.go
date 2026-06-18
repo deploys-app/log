@@ -60,15 +60,8 @@ func (c *Client) WatchPods(ctx context.Context, f func(eventType string, p *Pod)
 				Message:            x.Message,
 			})
 		}
-		if len(obj.Status.ContainerStatuses) > 0 {
-			x := obj.Status.ContainerStatuses[0]
-			res.Status.ContainerStatus = ContainerStatus{
-				Ready:        x.Ready,
-				RestartCount: int(x.RestartCount),
-				Image:        x.Image,
-				ImageID:      x.ImageID,
-				Started:      pointer.BoolDeref(x.Started, false),
-			}
+		if x := pickAppContainerStatus(obj.Status.ContainerStatuses); x != nil {
+			res.Status.ContainerStatus = projectContainerStatus(*x)
 		}
 		f(string(p.Type), &res)
 	}
@@ -101,13 +94,62 @@ type PodCondition struct {
 }
 
 type ContainerStatus struct {
-	// State                string `json:"state"`
-	// LastTerminationState string `json:"lastState"`
 	Ready        bool   `json:"ready"`
 	RestartCount int    `json:"restartCount"`
 	Image        string `json:"image"`
 	ImageID      string `json:"imageId"`
 	Started      bool   `json:"started"`
+
+	// Failure detail for the 'app' container. State.Waiting carries the
+	// current reason (CrashLoopBackOff, ImagePullBackOff, ...); Terminated
+	// carries the exit of the running instance; LastTerminated preserves the
+	// exit code / OOM signal of the previous instance, which is the only
+	// place the cause survives once a crash-looping pod is back in Waiting.
+	WaitingReason          string `json:"waitingReason,omitempty"`
+	WaitingMessage         string `json:"waitingMessage,omitempty"`
+	TerminatedReason       string `json:"terminatedReason,omitempty"`
+	TerminatedExitCode     int32  `json:"terminatedExitCode,omitempty"`
+	LastTerminatedReason   string `json:"lastTerminatedReason,omitempty"`
+	LastTerminatedExitCode int32  `json:"lastTerminatedExitCode,omitempty"`
+}
+
+// pickAppContainerStatus returns the status of the primary container (named
+// "app" by the deployer). Pods may carry sidecars whose index is not
+// guaranteed, so positional [0] is wrong; fall back to [0] only when no "app"
+// container exists, preserving prior behaviour for single-container pods.
+func pickAppContainerStatus(statuses []v1.ContainerStatus) *v1.ContainerStatus {
+	for i := range statuses {
+		if statuses[i].Name == "app" {
+			return &statuses[i]
+		}
+	}
+	if len(statuses) > 0 {
+		return &statuses[0]
+	}
+	return nil
+}
+
+func projectContainerStatus(x v1.ContainerStatus) ContainerStatus {
+	cs := ContainerStatus{
+		Ready:        x.Ready,
+		RestartCount: int(x.RestartCount),
+		Image:        x.Image,
+		ImageID:      x.ImageID,
+		Started:      pointer.BoolDeref(x.Started, false),
+	}
+	if w := x.State.Waiting; w != nil {
+		cs.WaitingReason = w.Reason
+		cs.WaitingMessage = w.Message
+	}
+	if t := x.State.Terminated; t != nil {
+		cs.TerminatedReason = t.Reason
+		cs.TerminatedExitCode = t.ExitCode
+	}
+	if lt := x.LastTerminationState.Terminated; lt != nil {
+		cs.LastTerminatedReason = lt.Reason
+		cs.LastTerminatedExitCode = lt.ExitCode
+	}
+	return cs
 }
 
 func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func(l *LogEntry)) error {
