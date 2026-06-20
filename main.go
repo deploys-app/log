@@ -123,6 +123,33 @@ func validToken(token string) (subject string, ok bool) {
 	return claim.Subject, true
 }
 
+// maxTailLines backstops the per-pod tail a caller can request from this
+// service. The apiserver already clamps deployment.logs to [1, 1000]; this is a
+// defence-in-depth cap for any direct caller.
+const maxTailLines = 5000
+
+func parseTailLines(s string) int64 {
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 1000 // historical console default
+	}
+	if n > maxTailLines {
+		return maxTailLines
+	}
+	return int64(n)
+}
+
+func podMatchExists(podID string) bool {
+	podsLocker.RLock()
+	defer podsLocker.RUnlock()
+	for name := range pods {
+		if strings.HasPrefix(name, podID) {
+			return true
+		}
+	}
+	return false
+}
+
 func logHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -139,12 +166,30 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	if responseType == "" {
 		responseType = "sse"
 	}
+	if responseType != "sse" && responseType != "text" && responseType != "json" {
+		http.Error(w, "Invalid type parameter", http.StatusBadRequest)
+		return
+	}
+
+	// follow defaults to true (the console SSE stream). A JSON response is always
+	// a bounded snapshot; an explicit follow=0 also forces a snapshot for the
+	// text/sse types (the agent/CLI bounded-read path).
+	follow := r.FormValue("follow") != "0"
+	previous := r.FormValue("previous") == "1"
+	tail := parseTailLines(r.FormValue("tail"))
+
+	if responseType == "json" || !follow {
+		writeLogsSnapshot(w, r, podID, responseType, raw, k8s.LogsOptions{
+			Follow:    false,
+			TailLines: tail,
+			Previous:  previous,
+			Pod:       r.FormValue("pod"),
+		})
+		return
+	}
 
 	var send func(l *k8s.LogEntry)
 	switch responseType {
-	default:
-		http.Error(w, "Invalid type parameter", http.StatusBadRequest)
-		return
 	case "sse":
 		send = func(l *k8s.LogEntry) {
 			bs, _ := json.Marshal(l)
@@ -172,25 +217,16 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	f.Flush()
 
-	// check pod must > 0
-	podExists := false
-	podsLocker.RLock()
-	for name := range pods {
-		if !strings.HasPrefix(name, podID) {
-			continue
-		}
-		podExists = true
-		break
-	}
-	podsLocker.RUnlock()
-
-	if !podExists {
-		// back-off
+	if !podMatchExists(podID) {
+		// back-off (the console reconnects in a loop)
 		time.Sleep(2 * time.Second)
 		return
 	}
 
-	err := k8sClient.Logs(r.Context(), podID, 1000, func(l *k8s.LogEntry) {
+	err := k8sClient.Logs(r.Context(), podID, k8s.LogsOptions{
+		Follow:    true,
+		TailLines: tail,
+	}, func(l *k8s.LogEntry) {
 		defer func() {
 			recover()
 		}()
@@ -203,6 +239,49 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		slog.Warn("get logs failed", "pod", podID, "error", err)
+	}
+}
+
+// writeLogsSnapshot serves a bounded, non-follow log read: it collects each
+// pod's tail to completion, then writes the result in the requested shape
+// (json array / plain text / sse events). For a snapshot it skips the SSE
+// reconnect back-off and simply returns an empty result when no pods exist.
+func writeLogsSnapshot(w http.ResponseWriter, r *http.Request, podID, responseType string, raw bool, opts k8s.LogsOptions) {
+	entries := []*k8s.LogEntry{}
+	if podMatchExists(podID) {
+		err := k8sClient.Logs(r.Context(), podID, opts, func(l *k8s.LogEntry) {
+			entries = append(entries, l)
+		})
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = nil
+		}
+		if err != nil {
+			slog.Warn("get logs failed", "pod", podID, "error", err)
+		}
+	}
+
+	switch responseType {
+	case "json":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(entries)
+	case "text":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		for _, l := range entries {
+			if raw {
+				fmt.Fprintf(w, "%s\n", l.Log)
+			} else {
+				fmt.Fprintf(w, "%s %s %s\n", l.Timestamp.Format(time.RFC3339), l.Pod, l.Log)
+			}
+		}
+	default: // sse
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for _, l := range entries {
+			bs, _ := json.Marshal(l)
+			fmt.Fprintf(w, "data: %s\n\n", string(bs))
+		}
 	}
 }
 
