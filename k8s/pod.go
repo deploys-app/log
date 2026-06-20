@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -14,6 +16,11 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/utils/pointer"
 )
+
+// primaryContainerName is the canonical primary container the deployer creates
+// for every workload; the projection and log reads pin it by name so a sidecar
+// can't masquerade as the app's health or output.
+const primaryContainerName = "app"
 
 func (c *Client) GetPods(ctx context.Context, id string) ([]v1.Pod, error) {
 	resp, err := c.client.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
@@ -152,10 +159,23 @@ func projectContainerStatus(x v1.ContainerStatus) ContainerStatus {
 	return cs
 }
 
-func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func(l *LogEntry)) error {
-	slog.InfoContext(ctx, "k8s/logs: getting logs", "id", id)
+// LogsOptions controls a Logs read.
+//
+// Follow selects the streaming path (the console SSE), which tails the live
+// container indefinitely. !Follow selects a bounded snapshot that reads each
+// pod's tail to completion and returns — the shape an agent/CLI consumes as a
+// single result. Previous reads the last-terminated ("previous") container
+// instead of the running one — the crash post-mortem. Pod, when set, restricts
+// the read to a single pod of the deployment.
+type LogsOptions struct {
+	Follow    bool
+	TailLines int64
+	Previous  bool
+	Pod       string
+}
 
-	s := c.client.CoreV1().Pods(c.namespace)
+func (c *Client) Logs(ctx context.Context, id string, opts LogsOptions, each func(l *LogEntry)) error {
+	slog.InfoContext(ctx, "k8s/logs: getting logs", "id", id, "follow", opts.Follow, "previous", opts.Previous)
 
 	pods, err := c.GetPods(ctx, id)
 	if err != nil {
@@ -166,6 +186,49 @@ func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func
 	if len(pods) == 0 {
 		return nil
 	}
+
+	var selected []v1.Pod
+	for _, pod := range pods {
+		if opts.Pod != "" && pod.Name != opts.Pod {
+			continue
+		}
+
+		// k8s 1.18 scheduler spam with NodeAffinity event
+		if pod.Status.Phase == "Failed" && pod.Status.Reason == "NodeAffinity" {
+			continue
+		}
+
+		// skip Evicted pod (no container logs to read)
+		if pod.Status.Reason == "Evicted" {
+			continue
+		}
+
+		// The follow path streams a live container, so a Terminated pod (whose
+		// stream returns immediately) was historically skipped. The snapshot
+		// path WANTS terminated pods — that's exactly where a crashed
+		// container's logs live — so it does not skip them.
+		if opts.Follow && pod.Status.Reason == "Terminated" {
+			continue
+		}
+
+		selected = append(selected, pod)
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+
+	if !opts.Follow {
+		return c.logsSnapshot(ctx, selected, opts, each)
+	}
+	return c.logsFollow(ctx, selected, opts, each)
+}
+
+// logsFollow streams the live "app" container of each pod until the context is
+// cancelled (the console SSE path). It keeps the original first-EOF-cancels
+// semantics, which are correct for follow reads where EOF effectively never
+// happens.
+func (c *Client) logsFollow(ctx context.Context, pods []v1.Pod, opts LogsOptions, each func(l *LogEntry)) error {
+	s := c.client.CoreV1().Pods(c.namespace)
 
 	chEach := make(chan *LogEntry)
 	defer close(chEach)
@@ -179,30 +242,15 @@ func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func
 	defer cancel()
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, pod := range pods {
-		// k8s 1.18 scheduler spam with NodeAffinity event
-		if pod.Status.Phase == "Failed" && pod.Status.Reason == "NodeAffinity" {
-			continue
-		}
-
-		// skip Evicted pod
-		if pod.Status.Reason == "Evicted" {
-			continue
-		}
-
-		// skip Terminated pod
-		if pod.Status.Reason == "Terminated" {
-			continue
-		}
-
 		eg.Go(func() error {
 			stream, err := s.GetLogs(pod.Name, &v1.PodLogOptions{
-				Container:  "app",
+				Container:  primaryContainerName,
 				Timestamps: true,
 				Follow:     true,
-				TailLines:  pointer.Int64(tailLines),
+				TailLines:  pointer.Int64(opts.TailLines),
 			}).Stream(ctx)
 			if err != nil {
-				slog.ErrorContext(ctx, "k8s/logs: can not stream GetLogs", "id", id, "err", err)
+				slog.ErrorContext(ctx, "k8s/logs: can not stream GetLogs", "pod", pod.Name, "err", err)
 				return err
 			}
 			defer stream.Close()
@@ -226,24 +274,100 @@ func (c *Client) Logs(ctx context.Context, id string, tailLines int64, each func
 				select {
 				case line = <-chLine:
 				case <-ctx.Done():
-					slog.InfoContext(ctx, "k8s/logs: context done", "id", id, "err", err)
 					return ctx.Err()
 				}
 
-				p := strings.SplitN(line, " ", 2)
-				if lp := len(p); lp >= 1 {
-					var l LogEntry
-					l.Pod = pod.Name
-					l.Timestamp, _ = time.Parse(time.RFC3339Nano, p[0])
-					if lp == 2 {
-						l.Log = p[1]
-					}
-					chEach <- &l
+				if l := parseLogEntry(pod.Name, line); l != nil {
+					chEach <- l
 				}
 			}
 		})
 	}
 	return eg.Wait()
+}
+
+// logsSnapshot reads each pod's tail to completion concurrently and emits the
+// collected lines pod-by-pod. Unlike the follow path it must NOT cancel
+// siblings on the first pod's EOF: with Follow:false every reader EOFs almost
+// immediately, and a first-EOF cancel would truncate the others mid-drain. It
+// is best-effort — a per-pod read error (e.g. no previous container) is logged
+// and skipped, not propagated.
+func (c *Client) logsSnapshot(ctx context.Context, pods []v1.Pod, opts LogsOptions, each func(l *LogEntry)) error {
+	results := make([][]*LogEntry, len(pods))
+
+	var wg sync.WaitGroup
+	for i := range pods {
+		wg.Add(1)
+		// i is passed explicitly so each goroutine owns its result slot — correct
+		// regardless of loop-variable scoping assumptions.
+		go func(i int) {
+			defer wg.Done()
+			entries, err := c.readPodLogTail(ctx, pods[i].Name, opts)
+			if err != nil {
+				slog.WarnContext(ctx, "k8s/logs: read tail failed", "pod", pods[i].Name, "err", err)
+				return
+			}
+			results[i] = entries
+		}(i)
+	}
+	wg.Wait()
+
+	// emit sequentially so the caller's callback need not be goroutine-safe.
+	for _, entries := range results {
+		for _, e := range entries {
+			each(e)
+		}
+	}
+	return nil
+}
+
+func (c *Client) readPodLogTail(ctx context.Context, podName string, opts LogsOptions) ([]*LogEntry, error) {
+	s := c.client.CoreV1().Pods(c.namespace)
+	stream, err := s.GetLogs(podName, &v1.PodLogOptions{
+		Container:  primaryContainerName,
+		Timestamps: true,
+		Follow:     false,
+		Previous:   opts.Previous,
+		TailLines:  pointer.Int64(opts.TailLines),
+	}).Stream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	var entries []*LogEntry
+	r := bufio.NewReader(stream)
+	for {
+		line, err := r.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		if line != "" {
+			if l := parseLogEntry(podName, line); l != nil {
+				entries = append(entries, l)
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return entries, err
+		}
+	}
+	return entries, nil
+}
+
+// parseLogEntry splits a "<rfc3339nano-ts> <log...>" line (k8s Timestamps:true)
+// into a LogEntry. Returns nil for an empty line.
+func parseLogEntry(podName, line string) *LogEntry {
+	p := strings.SplitN(line, " ", 2)
+	if len(p) < 1 || p[0] == "" {
+		return nil
+	}
+	l := &LogEntry{Pod: podName}
+	l.Timestamp, _ = time.Parse(time.RFC3339Nano, p[0])
+	if len(p) == 2 {
+		l.Log = p[1]
+	}
+	return l
 }
 
 type LogEntry struct {
