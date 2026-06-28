@@ -30,13 +30,20 @@ var config = configfile.NewEnvReader()
 
 var k8sClient *k8s.Client
 
+// Config read at startup (see main). Kept as package-level vars rather than
+// MustX initializers so the package can be imported in tests without the
+// environment present; main still fails fast on a missing value.
 var (
-	jwtSecret = config.MustBytes("token")
-	location  = config.MustString("location")
-	namespace = config.MustString("namespace")
+	jwtSecret []byte
+	location  string
+	namespace string
 )
 
 func main() {
+	jwtSecret = config.MustBytes("token")
+	location = config.MustString("location")
+	namespace = config.MustString("namespace")
+
 	var err error
 	// k8sClient, err = k8s.NewLocalClient(namespace)
 	k8sClient, err = k8s.NewClient(namespace)
