@@ -96,3 +96,22 @@ func TestParseTailLines(t *testing.T) {
 		}
 	}
 }
+
+func TestLogsContentType(t *testing.T) {
+	// Default SSE (and type=text Raw) are often opened in a browser tab;
+	// charset=utf-8 is required so Thai and other non-ASCII log lines render.
+	tests := []struct {
+		responseType string
+		want         string
+	}{
+		{"text", "text/plain; charset=utf-8"},
+		{"json", "application/json; charset=utf-8"},
+		{"sse", "text/event-stream; charset=utf-8"},
+		{"", "text/event-stream; charset=utf-8"}, // default / unknown treated as sse
+	}
+	for _, tt := range tests {
+		if got := logsContentType(tt.responseType); got != tt.want {
+			t.Errorf("logsContentType(%q) = %q; want %q", tt.responseType, got, tt.want)
+		}
+	}
+}

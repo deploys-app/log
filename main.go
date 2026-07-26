@@ -220,7 +220,11 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream")
+	// Users often open the log URL (default SSE) directly in a browser tab.
+	// Without charset=utf-8 the browser may decode UTF-8 log text (e.g. Thai)
+	// as a legacy encoding. EventSource still treats the stream as UTF-8;
+	// the parameter only affects tab display and type=text Raw links.
+	w.Header().Set("Content-Type", logsContentType(responseType))
 	w.WriteHeader(http.StatusOK)
 	f.Flush()
 
@@ -249,6 +253,20 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// logsContentType is the Content-Type for a log response of the given type
+// (sse / text / json). charset=utf-8 is required so browsers that open the
+// URL as a document render non-ASCII (e.g. Thai) correctly.
+func logsContentType(responseType string) string {
+	switch responseType {
+	case "json":
+		return "application/json; charset=utf-8"
+	case "text":
+		return "text/plain; charset=utf-8"
+	default: // sse
+		return "text/event-stream; charset=utf-8"
+	}
+}
+
 // writeLogsSnapshot serves a bounded, non-follow log read: it collects each
 // pod's tail to completion, then writes the result in the requested shape
 // (json array / plain text / sse events). For a snapshot it skips the SSE
@@ -267,14 +285,12 @@ func writeLogsSnapshot(w http.ResponseWriter, r *http.Request, podID, responseTy
 		}
 	}
 
+	w.Header().Set("Content-Type", logsContentType(responseType))
+	w.WriteHeader(http.StatusOK)
 	switch responseType {
 	case "json":
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(entries)
 	case "text":
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
 		for _, l := range entries {
 			if raw {
 				fmt.Fprintf(w, "%s\n", l.Log)
@@ -283,8 +299,6 @@ func writeLogsSnapshot(w http.ResponseWriter, r *http.Request, podID, responseTy
 			}
 		}
 	default: // sse
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
 		for _, l := range entries {
 			bs, _ := json.Marshal(l)
 			fmt.Fprintf(w, "data: %s\n\n", string(bs))
