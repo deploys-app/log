@@ -220,7 +220,10 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f := w.(http.Flusher)
-	w.Header().Set("Content-Type", "text/event-stream")
+	// type=text&raw=1 is opened in a browser tab (console Raw link). Without
+	// text/plain; charset=utf-8 the browser may decode UTF-8 (e.g. Thai) as
+	// a legacy encoding. Follow must match the snapshot path's Content-Type.
+	w.Header().Set("Content-Type", logsContentType(responseType))
 	w.WriteHeader(http.StatusOK)
 	f.Flush()
 
@@ -249,6 +252,20 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// logsContentType is the Content-Type for a log response of the given type
+// (sse / text / json). Text must declare charset=utf-8 so browsers open raw
+// streams with correct Unicode (Thai, etc.).
+func logsContentType(responseType string) string {
+	switch responseType {
+	case "json":
+		return "application/json"
+	case "text":
+		return "text/plain; charset=utf-8"
+	default: // sse
+		return "text/event-stream"
+	}
+}
+
 // writeLogsSnapshot serves a bounded, non-follow log read: it collects each
 // pod's tail to completion, then writes the result in the requested shape
 // (json array / plain text / sse events). For a snapshot it skips the SSE
@@ -267,14 +284,12 @@ func writeLogsSnapshot(w http.ResponseWriter, r *http.Request, podID, responseTy
 		}
 	}
 
+	w.Header().Set("Content-Type", logsContentType(responseType))
+	w.WriteHeader(http.StatusOK)
 	switch responseType {
 	case "json":
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(entries)
 	case "text":
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
 		for _, l := range entries {
 			if raw {
 				fmt.Fprintf(w, "%s\n", l.Log)
@@ -283,8 +298,6 @@ func writeLogsSnapshot(w http.ResponseWriter, r *http.Request, podID, responseTy
 			}
 		}
 	default: // sse
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
 		for _, l := range entries {
 			bs, _ := json.Marshal(l)
 			fmt.Fprintf(w, "data: %s\n\n", string(bs))

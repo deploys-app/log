@@ -96,3 +96,22 @@ func TestParseTailLines(t *testing.T) {
 		}
 	}
 }
+
+func TestLogsContentType(t *testing.T) {
+	// type=text is the console Raw tab (?type=text&raw=1); charset=utf-8 is
+	// required so Thai and other non-ASCII log lines render correctly.
+	tests := []struct {
+		responseType string
+		want         string
+	}{
+		{"text", "text/plain; charset=utf-8"},
+		{"json", "application/json"},
+		{"sse", "text/event-stream"},
+		{"", "text/event-stream"}, // default / unknown treated as sse
+	}
+	for _, tt := range tests {
+		if got := logsContentType(tt.responseType); got != tt.want {
+			t.Errorf("logsContentType(%q) = %q; want %q", tt.responseType, got, tt.want)
+		}
+	}
+}
