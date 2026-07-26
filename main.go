@@ -220,9 +220,10 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f := w.(http.Flusher)
-	// type=text&raw=1 is opened in a browser tab (console Raw link). Without
-	// text/plain; charset=utf-8 the browser may decode UTF-8 (e.g. Thai) as
-	// a legacy encoding. Follow must match the snapshot path's Content-Type.
+	// Users often open the log URL (default SSE) directly in a browser tab.
+	// Without charset=utf-8 the browser may decode UTF-8 log text (e.g. Thai)
+	// as a legacy encoding. EventSource still treats the stream as UTF-8;
+	// the parameter only affects tab display and type=text Raw links.
 	w.Header().Set("Content-Type", logsContentType(responseType))
 	w.WriteHeader(http.StatusOK)
 	f.Flush()
@@ -253,16 +254,16 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // logsContentType is the Content-Type for a log response of the given type
-// (sse / text / json). Text must declare charset=utf-8 so browsers open raw
-// streams with correct Unicode (Thai, etc.).
+// (sse / text / json). charset=utf-8 is required so browsers that open the
+// URL as a document render non-ASCII (e.g. Thai) correctly.
 func logsContentType(responseType string) string {
 	switch responseType {
 	case "json":
-		return "application/json"
+		return "application/json; charset=utf-8"
 	case "text":
 		return "text/plain; charset=utf-8"
 	default: // sse
-		return "text/event-stream"
+		return "text/event-stream; charset=utf-8"
 	}
 }
 
