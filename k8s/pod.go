@@ -297,18 +297,14 @@ func (c *Client) logsSnapshot(ctx context.Context, pods []v1.Pod, opts LogsOptio
 
 	var wg sync.WaitGroup
 	for i := range pods {
-		wg.Add(1)
-		// i is passed explicitly so each goroutine owns its result slot — correct
-		// regardless of loop-variable scoping assumptions.
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			entries, err := c.readPodLogTail(ctx, pods[i].Name, opts)
 			if err != nil {
 				slog.WarnContext(ctx, "k8s/logs: read tail failed", "pod", pods[i].Name, "err", err)
 				return
 			}
 			results[i] = entries
-		}(i)
+		})
 	}
 	wg.Wait()
 
